@@ -8,7 +8,7 @@ export const getArugasData = async (date: string) => {
 	const environment = process.env["ENVIRONMENT"];
 	const organizationId = process.env[`${environment}_ARUGAS_ORG_ID`] as string;
 	try {
-		const response = await fetch(`https://portal.arugas.com/ARGGPS/ArugasService.svc/GetOrder/${date}`, {
+		const response = await fetch(`https://portal.arugas.com/ARGGPS/ArugasService.svc/GetDispatch/${date}`, {
 			headers: {
 				Authorization,
 			},
@@ -17,7 +17,9 @@ export const getArugasData = async (date: string) => {
 		if (!response.ok) {
 			throw new Error(`Server responded with a status of ${response.status}`);
 		}
-		const { OrderList: data } = await response.json();
+		const { DispatchList: data } = await response.json();
+
+		// console.log("Daata >>>", JSON.stringify(response.json(), null, 2));
 		const trimmedData = data.map((item: any) => {
 			const trimmedItem: { [key: string]: any } = {};
 			Object.keys(item).forEach((key) => {
@@ -122,6 +124,10 @@ const addOrders = async (trimmedData: any, organizationId: string, dateString: s
 
 	const ordersRef = db.ref(`/organizations/${organizationId}/orders/date/${dateString}`);
 
+	const vehiclesRef = admin.database().ref(`/organizations/${organizationId}/vehicles`);
+	const vehiclesSnapshot = await vehiclesRef.once("value");
+	let vehicles = vehiclesSnapshot.val() || {};
+
 	const ordersSnapshot = await ordersRef.once("value");
 	let orders = ordersSnapshot.val() || {};
 	const updates: { [key: string]: any } = {};
@@ -136,12 +142,17 @@ const addOrders = async (trimmedData: any, organizationId: string, dateString: s
 				if (customers) {
 					customerId = Object.keys(customers).find((key) => customers[key].code === item.clientID);
 				}
+				let vehicleId = null;
+
+				if (vehicles) {
+					vehicleId = Object.keys(vehicles).find((key) => vehicles[key].licensePlate === item.vehicle);
+				}
 
 				if (customerId) {
 					// Voeg order toe
 					const newOrder = {
 						customerId,
-						vehicleId: item.vehicle,
+						vehicleId,
 						expectedDeliveryDate: dateString,
 						orderNumber: item.orderNumber,
 						notes: item.notes || "",
