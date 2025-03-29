@@ -4,12 +4,37 @@ import { fetchArugasData, scheduledFetchArugasData } from "./arugas";
 import { updateArugasCustomerLocation } from "./arugas/Event";
 import { cleanUpDuplicateCustomers } from "./helper/CleanUpUnusedCustomers";
 import { fetchLastLocationUsers } from "./location";
+import { importCustomers } from "./migrations/customers/importCustomers";
+import { validateCustomerMigration } from "./migrations/customers/validateCustomerMigration";
 import { removeAllOrders } from "./order";
 // import { updateOrderEvent } from "./order/Event";
+import * as functions from "firebase-functions";
 import { fetchLastUserLocation } from "./user";
+
 require("dotenv").config();
 
-const environment = process.env["ENVIRONMENT"];
+// Emulator configuratie
+const loadEmulatorConfig = () => {
+	if (process.env.FUNCTIONS_EMULATOR === "true") {
+		try {
+			const fs = require("fs");
+			const path = require("path");
+			const configPath = path.resolve(__dirname, "../firebase-functions-config.json");
+
+			if (fs.existsSync(configPath)) {
+				const configJson = JSON.parse(fs.readFileSync(configPath, "utf8"));
+				process.env.FIREBASE_CONFIG = JSON.stringify(configJson);
+				console.log("Emulator config loaded:", configJson);
+			}
+		} catch (error) {
+			console.error("Error loading emulator config:", error);
+		}
+	}
+};
+
+loadEmulatorConfig();
+
+const environment = functions.config().environment?.mode;
 const privateKey = process.env[`${environment}_FIREBASE_PRIVATE_KEY`];
 
 const serviceAccount: admin.ServiceAccount = {
@@ -31,9 +56,19 @@ admin.initializeApp({
 exports.fetchArugasData = fetchArugasData;
 exports.scheduledFetchArugasData = scheduledFetchArugasData;
 exports.updateArugasCustomerLocation = updateArugasCustomerLocation;
+exports.importCustomers = importCustomers;
+exports.validateCustomerMigration = validateCustomerMigration;
 
 exports.removeAllOrders = removeAllOrders;
 exports.fetchLastUserLocation = fetchLastUserLocation;
 
 exports.fetchLastLocationUsers = fetchLastLocationUsers;
 exports.cleanUpDuplicateCustomers = cleanUpDuplicateCustomers;
+
+// Test functie om de config te controleren
+export const getConfig = functions.https.onRequest((req, res) => {
+	res.json({
+		environmentMode: functions.config().environment?.mode,
+		fullConfig: functions.config(),
+	});
+});

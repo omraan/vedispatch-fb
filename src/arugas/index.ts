@@ -59,10 +59,19 @@ type ArugasData = {
 	Cylinder5: string;
 	Cylinder6: string;
 };
-
+function detectChanges<T>(oldData: T, newData: T, skipKeys: string[]): Record<string, { old: any; new: any }> {
+	const changed: Record<string, { old: any; new: any }> = {};
+	for (const key in newData) {
+		if (skipKeys.includes(key)) continue; // overslaan van velden die je niet wilt overschrijven
+		if (newData[key] !== oldData[key]) {
+			changed[key] = { old: oldData[key], new: newData[key] };
+		}
+	}
+	return changed;
+}
 export const getArugasData = async (date: string) => {
 	const Authorization = "Basic VXNyX0dQUy5BVzphc2YkR2ZlZzQyJEYxMjAx";
-	const environment = process.env["ENVIRONMENT"];
+	const environment = functions.config().environment?.mode;
 	const organizationId = process.env[`${environment}_ARUGAS_ORG_ID`] as string;
 
 	const customFieldsRef = admin.database().ref(`/organizations/${organizationId}/custom-field-definitions`);
@@ -216,6 +225,11 @@ export const addOptimizedRoutes = async (
 	locationId: string,
 	transactionTypeId: string | null
 ) => {
+	if (!trimmedData || !trimmedData.length) {
+		console.log("Geen data om routes voor te optimaliseren");
+		return;
+	}
+
 	const db = admin.database();
 	const routesRef = db.ref(`/organizations/${organizationId}/routes/${date}`);
 	// const routesSnapshot = await routesRef.once("value");
@@ -229,14 +243,23 @@ export const addOptimizedRoutes = async (
 	let locations = locationsSnapshot.val() || {};
 
 	const vehicles = trimmedData.reduce((acc: any, item: ArugasData) => {
-		if (!acc[item.vehicle]) {
-			acc[item.vehicle] = {
-				licensePlate: item.vehicle,
-				...item,
-			};
+		if (item && item.vehicle) {
+			if (!acc[item.vehicle]) {
+				acc[item.vehicle] = {
+					licensePlate: item.vehicle,
+					...item,
+				};
+			}
+		} else {
+			console.log("Waarschuwing: Gevonden item zonder vehicle property", item);
 		}
 		return acc;
 	}, {});
+
+	if (Object.keys(vehicles).length === 0) {
+		console.log("Geen voertuigen gevonden in data, voortijdig beëindigd");
+		return;
+	}
 
 	const updatesRoutes: { [key: string]: any } = {};
 
@@ -300,6 +323,12 @@ export const addOptimizedRoutes = async (
 
 		// Process orders for each vehicle
 		for (const orderLine of trimmedData) {
+			// Controleer of orderLine en orderLine.clientID bestaan
+			if (!orderLine || !orderLine.clientID || !orderLine.vehicle) {
+				console.log("Waarschuwing: ongeldige orderLine data gevonden", orderLine);
+				continue;
+			}
+
 			const clientID = orderLine.clientID as string;
 			if (!customerOrdersMap[clientID]) {
 				customerOrdersMap[clientID] = [];
@@ -450,6 +479,11 @@ export const addOptimizedRoutes = async (
 					return { latitude: x.latitude, longitude: x.longitude };
 				})
 			);
+
+			if (!trips || trips.length === 0) {
+				console.log("No trips found for batch", batchIndex);
+				continue;
+			}
 			geometry = combineGeometries(geometry, trips[0].geometry);
 
 			const newDestinations = batch
@@ -562,7 +596,7 @@ export const checkAndAddVehicles = async (trimmedData: ArugasData[], organizatio
 		console.error(`Fout bij het controleren/toevoegen van voertuig: ${error}`);
 	}
 };
-const checkAndAddCustomers = async (
+export const checkAndAddCustomers = async (
 	trimmedData: ArugasData[],
 	organizationId: string,
 	lastCylindersId: string | null,
@@ -573,6 +607,8 @@ const checkAndAddCustomers = async (
 	let customers = customersSnapshot.val() || {};
 
 	const locationsRef = admin.database().ref(`/organizations/${organizationId}/locations`);
+	const locationsSnapshot = await locationsRef.once("value");
+	let locations = locationsSnapshot.val() || {};
 
 	const updatesCustomer: { [key: string]: any } = {};
 	const updatesLocation: { [key: string]: any } = {};
@@ -583,13 +619,16 @@ const checkAndAddCustomers = async (
 			if (addedCustomers.has(item.clientID)) {
 				continue;
 			}
-
-			const matchedCustomer = Object.values(customers).find((customer: any) => customer.code === item.clientID);
-
+			const matchedCustomerId = Object.keys(customers).find((key) => customers[key].code === item.clientID);
 			const last_six_cylinders = `${item.Cylinder1};${item.Cylinder2};${item.Cylinder3};${item.Cylinder4};${item.Cylinder5};${item.Cylinder6}`;
 
-			if (!matchedCustomer) {
+			// A) Bestaat de klant nog niet? => nieuwe klant en nieuwe locatie
+			if (!matchedCustomerId) {
 				const phoneNumbers = item.clientPhone ? item.clientPhone.split(" ").filter(Boolean) : [];
+				const newLocationRef = locationsRef.push();
+				const newLocationId = newLocationRef.key;
+
+				// Zet location-data
 				const newLocation: any = {
 					title: "Location 1",
 					postalCode: "",
@@ -603,68 +642,201 @@ const checkAndAddCustomers = async (
 					type: "CONSUMER",
 					isDefault: true,
 					serviceTime: "00:05:00",
-					createdBy: "System",
-					createdAt: Date.now(),
-					modifiedBy: "System",
-					modifiedAt: Date.now(),
 				};
 
-				const newLocationRef = locationsRef.push();
-				const newLocationId = newLocationRef.key;
+				newLocation.events = [
+					{
+						timestamp: Date.now(),
+						description: "Location created",
+						changedBy: "System",
+						changed: {
+							...newLocation,
+						},
+					},
+				];
+
+				newLocation.createdBy = "System";
+				newLocation.createdAt = Date.now();
+				newLocation.modifiedBy = "System";
+				newLocation.modifiedAt = Date.now();
 				if (newLocationId) {
 					updatesLocation[newLocationId] = newLocation;
 				}
 
-				const newCustomer: any = {
-					firstName: "",
-					lastName: item.clientname,
-					companyName: "",
-					email: "",
-					code: item.clientID,
-					phoneNumbers: phoneNumbers.map((phoneNumber: string) => ({
-						type: "MOBILE",
-						countryCode: "+297",
-						number: phoneNumber,
-					})),
-					notes: item.Client_notes || "",
-					type: item.Type === "Domestic" ? "PRIVATE" : "COMMERCIAL",
-					defaultLocationId: newLocationId,
-					createdBy: "System",
-					createdAt: Date.now(),
-					modifiedBy: "System",
-					modifiedAt: Date.now(),
-				};
-				const customFields: any[] = [];
-
-				if (lastCylindersId) {
-					customFields.push({
-						fieldId: lastCylindersId,
-						fieldName: "last_cylinders",
-						value: last_six_cylinders || "",
-					});
-				}
-				if (customCustomerTypeId) {
-					customFields.push({
-						fieldId: customCustomerTypeId,
-						fieldName: "customer_type",
-						value: item.Type,
-					});
-				}
+				// Zet customer-data
 				const newCustomerRef = customersRef.push();
 				const newCustomerId = newCustomerRef.key;
 				if (newCustomerId) {
-					updatesCustomer[newCustomerId] = {
-						...newCustomer,
+					const customFields: any[] = [];
+					if (lastCylindersId) {
+						customFields.push({
+							fieldId: lastCylindersId,
+							fieldName: "last_cylinders",
+							value: last_six_cylinders || "",
+						});
+					}
+					if (customCustomerTypeId) {
+						customFields.push({
+							fieldId: customCustomerTypeId,
+							fieldName: "customer_type",
+							value: item.Type,
+						});
+					}
+					const newCustomer: any = {
+						firstName: "",
+						lastName: item.clientname,
+						companyName: "",
+						email: "",
+						code: item.clientID,
+						phoneNumbers: phoneNumbers.map((phoneNumber: string) => ({
+							type: "MOBILE",
+							countryCode: "+297",
+							number: phoneNumber,
+						})),
+						notes: item.Client_notes || "",
+						type: item.Type === "Domestic" ? "PRIVATE" : "COMMERCIAL",
+						defaultLocationId: newLocationId,
 						customFields,
 					};
+					newCustomer.events = [
+						{
+							timestamp: Date.now(),
+							description: "Customer created",
+							changedBy: "System",
+							changed: {
+								...newCustomer,
+							},
+						},
+					];
+
+					newCustomer.createdBy = "System";
+					newCustomer.createdAt = Date.now();
+					newCustomer.modifiedBy = "System";
+					newCustomer.modifiedAt = Date.now();
+					updatesCustomer[newCustomerId] = newCustomer;
+				}
+			} else {
+				// B) Klant bestaat al => locatie & klant gedeeltelijk bijwerken via detectChanges
+				const matchedCustomer = customers[matchedCustomerId];
+				const locationId = matchedCustomer.defaultLocationId;
+				const matchedLocation = locations[locationId] || null;
+
+				// 1. Customer updates via detectChanges
+				// Bouw nieuw data object op met de waarden die we willen bijwerken
+				const newCustomerData: any = {
+					lastName: item.clientname,
+					notes: item.Client_notes || "",
+				};
+
+				// Houdt last_cylinders bij (speciale logica)
+				if (last_six_cylinders) {
+					// Maak een kopie van de bestaande customFields (of een lege array)
+					const updatedCustomFields = [...(matchedCustomer.customFields || [])];
+					const customFieldIndex = updatedCustomFields.findIndex(
+						(cf: any) => cf.fieldName === "last_cylinders"
+					);
+
+					if (customFieldIndex >= 0) {
+						const oldValue = updatedCustomFields[customFieldIndex].value;
+						if (oldValue !== last_six_cylinders) {
+							updatedCustomFields[customFieldIndex] = {
+								...updatedCustomFields[customFieldIndex],
+								value: last_six_cylinders,
+							};
+						}
+					} else if (lastCylindersId) {
+						updatedCustomFields.push({
+							fieldId: lastCylindersId,
+							fieldName: "last_cylinders",
+							value: last_six_cylinders,
+						});
+					}
+
+					// Voeg customFields toe aan de nieuwe data voor detectChanges
+					newCustomerData.customFields = updatedCustomFields;
+				}
+
+				// Detecteer de wijzigingen tussen matchedCustomer en newCustomerData
+				const changedFields = detectChanges(matchedCustomer, newCustomerData, []);
+
+				if (Object.keys(changedFields).length > 0) {
+					const customerUpdates: any = {};
+
+					// Pas alle wijzigingen toe op customerUpdates
+					for (const [key, { new: newValue }] of Object.entries(changedFields)) {
+						customerUpdates[key] = newValue;
+					}
+
+					// Voeg metadata toe
+					customerUpdates.modifiedAt = Date.now();
+					customerUpdates.modifiedBy = "System";
+
+					// Voeg een event toe aan de events array
+					const currentEvents = matchedCustomer.events || [];
+					currentEvents.push({
+						timestamp: Date.now(),
+						description: "Customer updated",
+						changedBy: "System",
+						changed: changedFields,
+					});
+					customerUpdates.events = currentEvents;
+
+					// Zorg dat updates voor deze klant worden toegevoegd
+					if (!updatesCustomer[matchedCustomerId]) {
+						updatesCustomer[matchedCustomerId] = {};
+					}
+					Object.assign(updatesCustomer[matchedCustomerId], customerUpdates);
+				}
+
+				// 2. Location updates via detectChanges (met overslaan van lat/lng)
+				if (matchedLocation) {
+					// Bouw nieuwe locatie data op met ALLEEN de velden die we willen bijwerken
+					const newLocationData: any = {
+						streetName: item.clientStreetName || matchedLocation.streetName,
+						streetNumber: item.clientHouseNumber || matchedLocation.streetNumber,
+					};
+
+					// We slaan latitude en longitude over bij het bijwerken
+					const skipKeys = ["latitude", "longitude"];
+					const locationChangedFields = detectChanges(matchedLocation, newLocationData, skipKeys);
+
+					if (Object.keys(locationChangedFields).length > 0) {
+						const locationUpdates: any = {};
+
+						// Pas alle wijzigingen toe op locationUpdates
+						for (const [key, { new: newValue }] of Object.entries(locationChangedFields)) {
+							locationUpdates[key] = newValue;
+						}
+
+						// Voeg metadata toe
+						locationUpdates.modifiedAt = Date.now();
+						locationUpdates.modifiedBy = "System";
+
+						// Voeg een event toe aan de events array
+						const currentLocEvents = matchedLocation.events || [];
+						currentLocEvents.push({
+							timestamp: Date.now(),
+							description: "Location updated",
+							changedBy: "System",
+							changed: locationChangedFields,
+						});
+						locationUpdates.events = currentLocEvents;
+
+						// Zorg dat updates voor deze locatie worden toegevoegd
+						if (!updatesLocation[locationId]) {
+							updatesLocation[locationId] = {};
+						}
+						Object.assign(updatesLocation[locationId], locationUpdates);
+					}
 				}
 			}
 			addedCustomers.add(item.clientID);
 		}
+
 		await customersRef.update(updatesCustomer);
 		await locationsRef.update(updatesLocation);
 	} catch (error) {
-		console.error(`Fout bij het controleren/toevoegen van klant`, error);
+		console.error(`Fout bij het controleren/updaten van klanten/locaties`, error);
 	}
 };
 
@@ -681,97 +853,6 @@ const generateUniqueTrackAndTraceCode = async (): Promise<string> => {
 
 	return trackAndTraceCode;
 };
-
-// const addDispatches = async (trimmedData: any, organizationId: string, dateString: string) => {
-// 	const db = admin.database();
-// 	const ordersSnapshot = await db.ref(`/organizations/${organizationId}/orders/date/${dateString}`).once("value");
-// 	const orders = ordersSnapshot.val() || {};
-
-// 	const vehiclesSnapshot = await db.ref(`/organizations/${organizationId}/vehicles`).once("value");
-// 	const vehicles = vehiclesSnapshot.val() || {};
-// 	const customerOrdersMap: { [customerId: string]: any[] } = {};
-
-// 	// Groepeer orders per klant
-// 	for (const orderId in orders) {
-// 		if (orders.hasOwnProperty(orderId)) {
-// 			const order = orders[orderId];
-// 			if (!customerOrdersMap[order.customerId]) {
-// 				customerOrdersMap[order.customerId] = [];
-// 			}
-// 			let input: { [key: string]: any } = { order, orderId };
-// 			const { vehicle, notes } = trimmedData.find((item: any) => item.orderNumber === order.orderNumber);
-// 			input.vehicleId = Object.keys(vehicles).find((key) => vehicles[key].licensePlate === vehicle) || "";
-// 			input.notes = notes || "";
-
-// 			customerOrdersMap[order.customerId].push(input);
-// 		}
-// 	}
-
-// 	const dispatchesRef = db.ref(`/organizations/${organizationId}/dispatches/date/${dateString}`);
-// 	const tntRef = db.ref(`/trackAndTraceIndex`);
-// 	const updatesDispatches: { [key: string]: any } = {};
-// 	const updatesTnt: { [key: string]: any } = {};
-
-// 	// Maak dispatches aan per klant
-// 	for (const customerId in customerOrdersMap) {
-// 		if (customerOrdersMap.hasOwnProperty(customerId)) {
-// 			const customerOrders = customerOrdersMap[customerId];
-// 			const trackAndTraceCode = await generateUniqueTrackAndTraceCode();
-
-// 			let newDispatch = {
-// 				trackAndTraceCode,
-// 				orderIds: customerOrders.map((order) => order.orderId),
-// 				orderNumbers: customerOrders.map((order) => order.orderNumber).filter(Boolean),
-// 				customerId,
-// 				vehicleId: customerOrders[0].vehicleId,
-// 				notes: customerOrders[0].notes,
-// 				expectedDeliveryDate: dateString,
-// 				status: "Open",
-// 				createdAt: new Date().toISOString(),
-// 				createdBy: "System",
-// 			};
-
-// 			const newDispatchWithFirstEvent = {
-// 				...newDispatch,
-// 				events: [
-// 					{
-// 						name: "Dispatch Created",
-// 						description: "Dispatch created and added to dispatch",
-// 						...newDispatch,
-// 					},
-// 				],
-// 			};
-// 			const newDispatchRef = dispatchesRef.push();
-// 			const newDispatchId = newDispatchRef.key;
-// 			if (newDispatchId) {
-// 				updatesDispatches[newDispatchId] = newDispatchWithFirstEvent;
-// 			}
-// 			const newTnt = {
-// 				date: dateString,
-// 				dispatchId: newDispatchId,
-// 				organizationId,
-// 			};
-// 			const newTntRef = tntRef.push();
-// 			const newTntId = newTntRef.key;
-
-// 			if (newTntId) {
-// 				updatesTnt[newTntId] = newTnt;
-// 			}
-// 		}
-// 	}
-// 	try {
-// 		await dispatchesRef.update(updatesDispatches);
-// 		console.log("All new dispatches have been pushed successfully.");
-// 	} catch (error) {
-// 		console.error("Error pushing new dispatches:", error);
-// 	}
-// 	try {
-// 		await tntRef.update(updatesTnt);
-// 		console.log("All new T&T's have been pushed successfully.");
-// 	} catch (error) {
-// 		console.error("Error pushing new T&T's:", error);
-// 	}
-// };
 
 export const fetchArugasData = functions.https.onRequest(async (req, res) => {
 	const date = req.query.date as string;
@@ -851,116 +932,3 @@ const getOptimizedTrip = async (start: LatLng, destinations: LatLng[]) => {
 	}));
 	return { waypoints, trips: tripsWithTimes };
 };
-
-// const addRoutes = async (organizationId: string, dateString: string) => {
-// 	const db = admin.database();
-
-// 	const customersRef = admin.database().ref(`/organizations/${organizationId}/customers`);
-// 	const customersSnapshot = await customersRef.once("value");
-// 	let customers = customersSnapshot.val() || {};
-
-// 	const dispatchRef = admin.database().ref(`/organizations/${organizationId}/dispatches/date/${dateString}`);
-// 	const dispatchesSnapshot = await dispatchRef.once("value");
-
-// 	const dispatches = dispatchesSnapshot.val() || {};
-// 	const vehiclesDispatchesMap: { [vehicleId: string]: any[] } = {};
-
-// 	// Groepeer dispatches per voertuig
-// 	for (const dispatchId in dispatches) {
-// 		if (dispatches.hasOwnProperty(dispatchId)) {
-// 			const dispatch = dispatches[dispatchId];
-// 			const vehicleId = dispatch.vehicleId;
-// 			if (!vehiclesDispatchesMap[vehicleId]) {
-// 				vehiclesDispatchesMap[vehicleId] = [];
-// 			}
-// 			vehiclesDispatchesMap[vehicleId].push({ ...dispatch, dispatchId });
-// 		}
-// 	}
-
-// 	let startLocation: LatLng = { latitude: 12.503286, longitude: -69.980893 };
-
-// 	// Maak routes aan per voertuig
-// 	for (const vehicleId in vehiclesDispatchesMap) {
-// 		if (vehiclesDispatchesMap.hasOwnProperty(vehicleId)) {
-// 			const vehicleDispatches = vehiclesDispatchesMap[vehicleId]
-// 				.map((item) => {
-// 					const { lat, lng } = customers[item.customerId];
-// 					const orderCoords = {
-// 						latitude: lat,
-// 						longitude: lng,
-// 					};
-// 					const distance = getDistance(startLocation, orderCoords);
-// 					return { ...item, distance, ...orderCoords };
-// 				})
-// 				.filter((row) => parseInt(row.latitude) !== 0)
-// 				.sort((a: any, b: any) => a.distance - b.distance);
-
-// 			// Verdeel dispatches in batches van maximaal 12 locaties
-// 			const batches = [];
-// 			for (let i = 0; i < vehicleDispatches.length; i += 11) {
-// 				const batch = vehicleDispatches.slice(i, i + 11);
-// 				batches.push(batch);
-// 			}
-
-// 			const routeDispatchIds: string[] = [];
-
-// 			for (const batch of batches) {
-// 				const routeResponse = await getOptimizedTrip(
-// 					startLocation,
-// 					batch.map((x) => {
-// 						return { latitude: x.latitude, longitude: x.longitude };
-// 					})
-// 				);
-
-// 				if (routeResponse.code !== "Ok") {
-// 					console.error("Error optimizing route:", routeResponse);
-// 					continue;
-// 				}
-// 				const { waypoints } = routeResponse;
-
-// 				const newDestinations = batch
-// 					.map((destination, indexDestination) => {
-// 						const relatedWaypoint = waypoints.find((waypoint: any, indexWaypoint: number) => {
-// 							// First waypoint is the start location, so we need to skip it.
-// 							return indexWaypoint - 1 === indexDestination;
-// 						});
-// 						return {
-// 							...destination,
-// 							waypoint_index: relatedWaypoint.waypoint_index,
-// 						};
-// 					})
-// 					.sort((a, b) => a.waypoint_index - b.waypoint_index);
-// 				routeDispatchIds.push(...newDestinations.map((x) => x.dispatchId));
-
-// 				startLocation = {
-// 					latitude: newDestinations[newDestinations.length - 1].latitude,
-// 					longitude: newDestinations[newDestinations.length - 1].longitude,
-// 				};
-// 			}
-
-// 			const route = {
-// 				vehicleId,
-// 				dispatchIds: routeDispatchIds,
-// 			};
-
-// 			const newRouteRef = await db.ref(`/organizations/${organizationId}/routes/date/${dateString}`).push(route);
-// 			const newRouteId = newRouteRef.key;
-
-// 			const updates: { [key: string]: any } = {};
-
-// 			for (const dispatchId in dispatches) {
-// 				if (dispatches.hasOwnProperty(dispatchId)) {
-// 					const dispatch = dispatches[dispatchId];
-// 					if (vehicleId === dispatch.vehicleId) {
-// 						const { vehicleId, ...rest } = dispatch;
-// 						updates[dispatchId] = {
-// 							...rest,
-// 							routeId: newRouteId,
-// 						};
-// 					}
-// 				}
-// 			}
-// 			dispatchRef.update(updates);
-// 		}
-// 	}
-// };

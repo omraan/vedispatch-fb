@@ -2,7 +2,7 @@ import * as admin from "firebase-admin";
 import * as functions from "firebase-functions";
 import moment from "moment";
 
-const environment = process.env["ENVIRONMENT"];
+const environment = functions.config().environment?.mode;
 const organizationId = process.env[`${environment}_ARUGAS_ORG_ID`];
 
 export const updateArugasCustomerLocation = functions.database
