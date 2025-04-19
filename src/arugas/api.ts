@@ -162,114 +162,14 @@ export const getArugasData = async (date: string) => {
 		const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
 		const routesSnapshot = await routesRef.once("value");
 		const routes = routesSnapshot.val() || {};
-		const routeCount = Object.keys(routes).length;
+		const routeIds = Object.keys(routes);
 
-		console.log(`Created ${routeCount} routes for date ${date}`);
+		console.log(`Created ${routeIds.length} routes for date ${date}`);
 
 		// Attempt route optimization if routes were created
-		if (routeCount > 0) {
+		if (routeIds.length > 0) {
 			try {
-				console.log("Attempting route optimization via VeDispatch");
-				const mapboxOptimizationId = await postRoutesToVedispatch(organizationId, date);
-
-				if (mapboxOptimizationId) {
-					console.log(`Starting optimization polling for ID: ${mapboxOptimizationId}`);
-
-					// Function to wait for a specified time
-					const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-					// Polling mechanism with retries
-					const maxRetries = 10;
-					const pollingInterval = 5000; // 5 seconds
-
-					let optimizationResult = null;
-					let retryCount = 0;
-
-					// Poll until we get a result or reach max retries
-					while (retryCount < maxRetries && !optimizationResult) {
-						console.log(`Polling optimization status (attempt ${retryCount + 1}/${maxRetries})...`);
-
-						try {
-							// Wait before checking
-							await sleep(pollingInterval);
-
-							// Check optimization status
-							optimizationResult = await getOptimizationFromVedispatch(mapboxOptimizationId);
-
-							if (optimizationResult) {
-								console.log(`Optimization completed successfully after ${retryCount + 1} attempts`);
-							}
-						} catch (error) {
-							console.error(`Error polling optimization (attempt ${retryCount + 1}):`, error);
-						}
-
-						retryCount++;
-					}
-
-					// If we have optimization results, update the route with the new stop sequence
-					if (optimizationResult) {
-						// Get routes to apply optimization results
-						const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
-						const routesSnapshot = await routesRef.once("value");
-						const routes = routesSnapshot.val() || {};
-						const routeIds = Object.keys(routes);
-
-						// Apply optimization results to each route
-						for (const routeId of routeIds) {
-							try {
-								console.log(`Fetching directions for route: ${routeId}`);
-
-								// Update route with stop sequence optimization before getting directions
-								const routeRef = routesRef.child(routeId);
-								const routeSnapshot = await routeRef.once("value");
-								const route = routeSnapshot.val();
-
-								if (route && route.stops) {
-									// Record original sequence for logging
-									const originalSequence: { [stopId: string]: number } = {};
-									Object.keys(route.stops).forEach((stopId) => {
-										if (route.stops[stopId].sequence !== undefined) {
-											originalSequence[stopId] = route.stops[stopId].sequence;
-										}
-									});
-
-									// Update stop sequences based on optimization results
-									optimizationResult.forEach((stop) => {
-										if (route.stops[stop.stopId]) {
-											route.stops[stop.stopId].sequence = stop.index;
-										}
-									});
-
-									// Log sequence changes
-									console.log(`Updated stop sequence for route ${routeId}:`);
-									Object.keys(route.stops).forEach((stopId) => {
-										if (
-											originalSequence[stopId] !== undefined &&
-											route.stops[stopId].sequence !== originalSequence[stopId]
-										) {
-											console.log(
-												`  - Stop ${stopId}: ${originalSequence[stopId]} -> ${route.stops[stopId].sequence}`
-											);
-										}
-									});
-
-									// Update route with new sequences
-									await routeRef.set(route);
-								}
-
-								// Get directions for the optimized route
-								await fetchRouteDirections(organizationId, routeId, date);
-								console.log(`Successfully updated route ${routeId} with optimized directions`);
-							} catch (directionError) {
-								console.error(`Error fetching directions for route ${routeId}:`, directionError);
-							}
-						}
-					} else {
-						console.warn(`Failed to get optimization results after ${maxRetries} attempts`);
-					}
-				} else {
-					console.warn("Route optimization not available or failed. Routes were created but not optimized.");
-				}
+				await Promise.all(routeIds.map((routeId) => optimizeRoute(organizationId, date, routeId)));
 			} catch (error) {
 				console.error("Error during route optimization process:", error);
 				console.log("Continuing with unoptimized routes");
@@ -282,6 +182,109 @@ export const getArugasData = async (date: string) => {
 	} catch (error) {
 		console.error("Error fetching data:", error);
 		throw new Error(`Internal server error.`);
+	}
+};
+
+const optimizeRoute = async (organizationId: string, date: string, routeId: string) => {
+	const mapboxOptimizationId = await postRouteToVedispatch(organizationId, date, routeId);
+
+	if (mapboxOptimizationId) {
+		console.log(`Starting optimization polling for ID: ${mapboxOptimizationId}`);
+
+		// Function to wait for a specified time
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+		// Polling mechanism with retries
+		const maxRetries = 10;
+		const pollingInterval = 5000; // 5 seconds
+
+		let optimizationResult = null;
+		let retryCount = 0;
+
+		// Poll until we get a result or reach max retries
+		while (retryCount < maxRetries && !optimizationResult) {
+			console.log(`Polling optimization status (attempt ${retryCount + 1}/${maxRetries})...`);
+
+			try {
+				// Wait before checking
+				await sleep(pollingInterval);
+
+				// Check optimization status
+				optimizationResult = await getOptimizationFromVedispatch(mapboxOptimizationId);
+
+				if (optimizationResult) {
+					console.log(`Optimization completed successfully after ${retryCount + 1} attempts`);
+				}
+			} catch (error) {
+				console.error(`Error polling optimization (attempt ${retryCount + 1}):`, error);
+			}
+
+			retryCount++;
+		}
+
+		// If we have optimization results, update the route with the new stop sequence
+		if (optimizationResult) {
+			// Get routes to apply optimization results
+			const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
+			const routesSnapshot = await routesRef.once("value");
+			const routes = routesSnapshot.val() || {};
+			const routeIds = Object.keys(routes);
+
+			// Apply optimization results to each route
+			for (const routeId of routeIds) {
+				try {
+					console.log(`Fetching directions for route: ${routeId}`);
+
+					// Update route with stop sequence optimization before getting directions
+					const routeRef = routesRef.child(routeId);
+					const routeSnapshot = await routeRef.once("value");
+					const route = routeSnapshot.val();
+
+					if (route && route.stops) {
+						// Record original sequence for logging
+						const originalSequence: { [stopId: string]: number } = {};
+						Object.keys(route.stops).forEach((stopId) => {
+							if (route.stops[stopId].sequence !== undefined) {
+								originalSequence[stopId] = route.stops[stopId].sequence;
+							}
+						});
+
+						// Update stop sequences based on optimization results
+						optimizationResult.forEach((stop) => {
+							if (route.stops[stop.stopId]) {
+								route.stops[stop.stopId].sequence = stop.index;
+							}
+						});
+
+						// Log sequence changes
+						console.log(`Updated stop sequence for route ${routeId}:`);
+						Object.keys(route.stops).forEach((stopId) => {
+							if (
+								originalSequence[stopId] !== undefined &&
+								route.stops[stopId].sequence !== originalSequence[stopId]
+							) {
+								console.log(
+									`  - Stop ${stopId}: ${originalSequence[stopId]} -> ${route.stops[stopId].sequence}`
+								);
+							}
+						});
+
+						// Update route with new sequences
+						await routeRef.set(route);
+					}
+
+					// Get directions for the optimized route
+					await fetchRouteDirections(organizationId, routeId, date);
+					console.log(`Successfully updated route ${routeId} with optimized directions`);
+				} catch (directionError) {
+					console.error(`Error fetching directions for route ${routeId}:`, directionError);
+				}
+			}
+		} else {
+			console.warn(`Failed to get optimization results after ${maxRetries} attempts`);
+		}
+	} else {
+		console.warn("Route optimization not available or failed. Routes were created but not optimized.");
 	}
 };
 
@@ -358,10 +361,7 @@ const transformRouteStopsForVedispatch = async (organizationId: string, route: a
 			};
 		})
 	);
-	console.log(
-		"stops",
-		stops.map((stop) => stop.value.location)
-	);
+
 	return stops;
 };
 
@@ -377,7 +377,7 @@ const transformVedispatchStopsBackToRoute = (stopsArray: Array<{ name: string; v
 	return stopsObject;
 };
 
-const postRoutesToVedispatch = async (organizationId: string, date: string) => {
+const postRouteToVedispatch = async (organizationId: string, date: string, routeId: string) => {
 	const environment = functions.config().environment?.mode;
 	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
 
@@ -387,26 +387,23 @@ const postRoutesToVedispatch = async (organizationId: string, date: string) => {
 		return null;
 	}
 
-	const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
+	const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}/${routeId}`);
 	const routesSnapshot = await routesRef.once("value");
-	const routes = routesSnapshot.val() || {};
+	const route = routesSnapshot.val() || {};
 
-	const routeIds = Object.keys(routes);
-	console.log(`Found ${routeIds.length} routes to optimize for date: ${date}`);
+	console.log(`Found route: ${routeId} for date: ${date}`);
 
-	if (routeIds.length === 0) {
-		console.log("No routes found to optimize");
+	if (!route) {
+		console.log("No route found to optimize");
 		return null;
 	}
 
 	try {
 		// Just use the first route for now to check connection
-		const routeId = routeIds[0];
 		const routeOptimizationRef = routesRef.child(routeId).child("optimization");
 
 		const apiUrl = `https://${vedispatchUrl}/api/route/optimize`;
 		console.log(`Calling VeDispatch API at: ${apiUrl}`);
-		const route = routes[routeId];
 		const stops = await transformRouteStopsForVedispatch(organizationId, route);
 
 		const response = await fetch(apiUrl, {
@@ -450,8 +447,8 @@ const postRoutesToVedispatch = async (organizationId: string, date: string) => {
 		if (result.status === "ok") {
 			const res = {
 				id: result.mapboxOptimizationId,
-				status: "PROCESSING",
-				message: "Optimization in progress",
+				state: "PROCESSING",
+				description: "Optimization in progress",
 				lastChecked: moment().toISOString(),
 			};
 
@@ -491,6 +488,10 @@ const fetchRouteDirections = async (organizationId: string, routeId: string, dat
 	const routeSnapshot = await routeRef.once("value");
 	const route = routeSnapshot.val() || {};
 	const stops = await transformRouteStopsForVedispatch(organizationId, route);
+
+	// Haal de huidige optimization ID op als deze bestaat
+	const currentOptimizationId = route.optimization?.id || null;
+
 	const response = await fetch(`https://${vedispatchUrl}/api/route/directions`, {
 		headers: {
 			"Content-Type": "application/json",
@@ -517,6 +518,19 @@ const fetchRouteDirections = async (organizationId: string, routeId: string, dat
 		newRoute.value.stops = transformVedispatchStopsBackToRoute(newRoute.value.stops);
 	}
 
-	await routeRef.set(newRoute.value);
+	// Gebruik de huidige optimization ID of een fallback waarde
+	const optimizationId = newRoute.value.mapboxOptimizationId || currentOptimizationId || `directions-${Date.now()}`;
+
+	const optimization = {
+		id: optimizationId,
+		state: "COMPLETE",
+		description: "Optimization completed",
+		lastChecked: moment().toISOString(),
+	};
+
+	await routeRef.set({
+		...newRoute.value,
+		optimization,
+	});
 	return newRoute;
 };
