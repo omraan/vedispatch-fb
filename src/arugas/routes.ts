@@ -1,10 +1,8 @@
 import * as admin from "firebase-admin";
-import moment from "moment";
-import { getOptimizedTrip } from "./mapbox";
 import { ArugasData, Route } from "./types";
-import { combineGeometries, generateUniqueTrackAndTraceCode, getDistance } from "./utils";
+import { generateUniqueTrackAndTraceCode } from "./utils";
 
-export const addOptimizedRoutes = async (
+export const addRoutes = async (
 	trimmedData: ArugasData[],
 	organizationId: string,
 	date: string,
@@ -430,177 +428,22 @@ export const addOptimizedRoutes = async (
 					}
 				}
 			}
-			// Find the start point stop ID
-			const startPointStopId = Object.keys(newRoute.stops).find(
-				(stopId) => newRoute.stops[stopId].type === "START_POINT"
-			);
-			if (!startPointStopId) {
-				throw new Error("No start point found in route");
-			}
-			let startLocation = locations[newRoute.stops[startPointStopId!].locationId!];
+			const newEndRouteStopRef = routeStopRef.push();
+			const newEndRouteStopId = newEndRouteStopRef.key;
 
-			const stopsOrdered = Object.keys(newRoute.stops)
-				.filter((routeStopId: string) => newRoute.stops[routeStopId].type !== "START_POINT")
-				.map((routeStopId: string) => {
-					const location = locations[newRoute.stops[routeStopId].dispatch!.locationId];
-					const { latitude, longitude } = location;
-					const orderCoords = {
-						latitude,
-						longitude,
-					};
-					const distance = getDistance(startLocation, orderCoords);
-					return { ...newRoute.stops[routeStopId], distance, ...orderCoords, routeStopId };
-				})
-				.filter((row) => parseInt(row.latitude) !== 0)
-				.sort((a: any, b: any) => a.distance - b.distance);
-
-			let geometry: string = "";
-			// Latest Time Arrival is end time of route.
-			let timeArrival: string = "";
-			// Current time is used to store the departure time for next iteration,
-			// so it can be used to calculate the arrival time for the next stop.
-			let currentTime = moment("06:30", "HH:mm");
-			// Verdeel dispatches in batches van maximaal 12 locaties
-			const batches = [];
-			for (let i = 0; i < stopsOrdered.length; i += 11) {
-				const batch = stopsOrdered.slice(i, i + 11);
-				batches.push(batch);
-			}
-			let batchIndex = 0;
-			for (const batch of batches) {
-				console.log(`Processing batch ${batchIndex + 1}/${batches.length} for vehicle ${vehicleKey}`);
-				try {
-					const { waypoints, trips } = await getOptimizedTrip(
-						startLocation,
-						batch.map((x) => {
-							return { latitude: x.latitude, longitude: x.longitude };
-						})
-					);
-					if (!trips || trips.length === 0) {
-						console.log(`No trips found for batch ${batchIndex} of vehicle ${vehicleKey}`);
-						// Voeg alle stops uit deze batch toe aan unscheduled dispatches
-						for (const stop of batch) {
-							const unscheduledDispatchData = {
-								...stop.dispatch,
-								events: [
-									{
-										title: "Dispatch created",
-										description: "Dispatch added to unscheduled dispatches due to no trips found",
-										userId: "System",
-										timestamp: new Date(),
-									},
-								],
-								vehicleId,
-								customerId: stop.dispatch?.customerId || "unknown",
-								locationId: stop.dispatch?.locationId || "unknown",
-							};
-							try {
-								await unscheduledDispatchesRef.push(unscheduledDispatchData);
-								console.log(
-									`Unscheduled dispatch toegevoegd voor klant ${stop.dispatch?.customerId} (geen trips gevonden)`
-								);
-							} catch (error) {
-								console.error(`Fout bij toevoegen van unscheduled dispatch:`, error);
-							}
-						}
-						continue;
-					}
-					geometry = combineGeometries(geometry, trips[0].geometry);
-
-					const newDestinations = batch
-						.map((destination, indexDestination) => {
-							const relatedWaypoint = waypoints.find((waypoint: any, indexWaypoint: number) => {
-								// First waypoint is the start location, so we need to skip it.
-								return indexWaypoint - 1 === indexDestination;
-							});
-
-							const duration = trips[0].legs[relatedWaypoint.waypoint_index - 1].duration;
-							const distance = trips[0].legs[relatedWaypoint.waypoint_index - 1].distance;
-
-							timeArrival = currentTime.add(duration, "seconds").format("HH:mm");
-							const serviceTime = moment.duration("00:05:00").asSeconds();
-							const newTimeDeparture = moment(timeArrival, "HH:mm").add(serviceTime, "seconds");
-							currentTime = newTimeDeparture.clone();
-
-							return {
-								...destination,
-								waypoint_index: relatedWaypoint.waypoint_index,
-								estimation: {
-									timeArrival,
-									timeDeparture: newTimeDeparture.format("HH:mm"),
-									duration,
-									distance,
-								},
-							};
-						})
-						.sort((a, b) => a.waypoint_index - b.waypoint_index);
-
-					// Create a temporary object to store the updated stops
-					const updatedStops = { ...newRoute.stops };
-
-					// Update sequences for stops in the current batch
-					Object.entries(updatedStops).forEach(([stopId, stop]: any) => {
-						const newStop = newDestinations.find((destination) => destination.routeStopId === stopId);
-						if (newStop) {
-							updatedStops[stopId] = {
-								...stop,
-								sequence: batchIndex * batch.length + newStop.waypoint_index,
-								estimation: {
-									...stop.estimation,
-									...newStop.estimation,
-								},
-							};
-						}
-					});
-
-					newRoute.stops = updatedStops;
-
-					startLocation = {
-						latitude: newDestinations[newDestinations.length - 1].latitude,
-						longitude: newDestinations[newDestinations.length - 1].longitude,
-					};
-					batchIndex++;
-				} catch (error) {
-					console.error(`Error processing batch ${batchIndex} for vehicle ${vehicleKey}:`, error);
-					// Voeg alle stops uit deze batch toe aan unscheduled dispatches
-					for (const stop of batch) {
-						const unscheduledDispatchData = {
-							...stop.dispatch,
-							events: [
-								{
-									title: "Dispatch created",
-									description: "Dispatch added to unscheduled dispatches due to processing error",
-									userId: "System",
-									timestamp: new Date(),
-								},
-							],
-							vehicleId,
-							customerId: stop.dispatch?.customerId || "unknown",
-							locationId: stop.dispatch?.locationId || "unknown",
-						};
-						try {
-							await unscheduledDispatchesRef.push(unscheduledDispatchData);
-							console.log(
-								`Unscheduled dispatch toegevoegd voor klant ${stop.dispatch?.customerId} (verwerkingsfout)`
-							);
-						} catch (error) {
-							console.error(`Fout bij toevoegen van unscheduled dispatch:`, error);
-						}
-					}
-				} finally {
-					setTimeout(() => {
-						batchIndex++;
-					}, 3000);
-				}
-			}
-			updatesRoutes[newRouteId!] = {
-				...newRoute,
-				estimation: {
-					...newRoute.estimation,
-					geometry,
-					timeEnd: timeArrival,
-				},
+			newRoute.stops[newEndRouteStopId!] = {
+				type: "END_POINT",
+				status: "Open",
+				sequence: sequence + 1,
+				locationId,
+				transitPointId,
+				createdAt: new Date(),
+				createdBy: "System",
 			};
+
+			// At the end of the for loop that iterates through vehicleKey and ordersInRoute
+			// After processing all orders, add the route to updatesRoutes
+			updatesRoutes[newRouteId] = newRoute;
 		}
 		await routesRef.update(updatesRoutes);
 	} catch (error) {

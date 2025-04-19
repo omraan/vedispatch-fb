@@ -23,7 +23,7 @@ export { checkAndAddVehicles } from "./vehicles";
 export { checkAndAddCustomers } from "./customers";
 
 // Export from routes.ts
-export { addOptimizedRoutes } from "./routes";
+export { addRoutes } from "./routes";
 
 // Export from mapbox.ts
 export { getOptimizedTrip } from "./mapbox";

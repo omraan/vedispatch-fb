@@ -1,8 +1,9 @@
 import * as admin from "firebase-admin";
 import * as functions from "firebase-functions";
+import moment from "moment";
 import { checkAndAddCustomers } from "./customers";
-import { addOptimizedRoutes } from "./routes";
-import { ArugasData, Route } from "./types";
+import { addRoutes } from "./routes";
+import { ArugasData } from "./types";
 import { checkAndAddVehicles } from "./vehicles";
 
 export const getArugasData = async (date: string) => {
@@ -149,40 +150,139 @@ export const getArugasData = async (date: string) => {
 			return trimmedItem;
 		});
 
+		// First process vehicles and customers
 		await checkAndAddVehicles(trimmedData, organizationId);
 		await checkAndAddCustomers(trimmedData, organizationId, lastCylindersId, customCustomerTypeId);
-		await addOptimizedRoutes(trimmedData, organizationId, date, transitPointId, locationId!, transactionTypeId);
+
+		// Then create the routes
+		console.log(`Creating routes for date: ${date}`);
+		await addRoutes(trimmedData, organizationId, date, transitPointId, locationId!, transactionTypeId);
+
+		// Verify routes were created
+		const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
+		const routesSnapshot = await routesRef.once("value");
+		const routes = routesSnapshot.val() || {};
+		const routeCount = Object.keys(routes).length;
+
+		console.log(`Created ${routeCount} routes for date ${date}`);
+
+		// Attempt route optimization if routes were created
+		if (routeCount > 0) {
+			try {
+				console.log("Attempting route optimization via VeDispatch");
+				const mapboxOptimizationId = await postRoutesToVedispatch(organizationId, date);
+
+				if (mapboxOptimizationId) {
+					console.log(`Starting optimization polling for ID: ${mapboxOptimizationId}`);
+
+					// Function to wait for a specified time
+					const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+					// Polling mechanism with retries
+					const maxRetries = 10;
+					const pollingInterval = 5000; // 5 seconds
+
+					let optimizationResult = null;
+					let retryCount = 0;
+
+					// Poll until we get a result or reach max retries
+					while (retryCount < maxRetries && !optimizationResult) {
+						console.log(`Polling optimization status (attempt ${retryCount + 1}/${maxRetries})...`);
+
+						try {
+							// Wait before checking
+							await sleep(pollingInterval);
+
+							// Check optimization status
+							optimizationResult = await getOptimizationFromVedispatch(mapboxOptimizationId);
+
+							if (optimizationResult) {
+								console.log(`Optimization completed successfully after ${retryCount + 1} attempts`);
+							}
+						} catch (error) {
+							console.error(`Error polling optimization (attempt ${retryCount + 1}):`, error);
+						}
+
+						retryCount++;
+					}
+
+					// If we have optimization results, update the route with the new stop sequence
+					if (optimizationResult) {
+						// Get routes to apply optimization results
+						const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
+						const routesSnapshot = await routesRef.once("value");
+						const routes = routesSnapshot.val() || {};
+						const routeIds = Object.keys(routes);
+
+						// Apply optimization results to each route
+						for (const routeId of routeIds) {
+							try {
+								console.log(`Fetching directions for route: ${routeId}`);
+
+								// Update route with stop sequence optimization before getting directions
+								const routeRef = routesRef.child(routeId);
+								const routeSnapshot = await routeRef.once("value");
+								const route = routeSnapshot.val();
+
+								if (route && route.stops) {
+									// Record original sequence for logging
+									const originalSequence: { [stopId: string]: number } = {};
+									Object.keys(route.stops).forEach((stopId) => {
+										if (route.stops[stopId].sequence !== undefined) {
+											originalSequence[stopId] = route.stops[stopId].sequence;
+										}
+									});
+
+									// Update stop sequences based on optimization results
+									optimizationResult.forEach((stop) => {
+										if (route.stops[stop.stopId]) {
+											route.stops[stop.stopId].sequence = stop.index;
+										}
+									});
+
+									// Log sequence changes
+									console.log(`Updated stop sequence for route ${routeId}:`);
+									Object.keys(route.stops).forEach((stopId) => {
+										if (
+											originalSequence[stopId] !== undefined &&
+											route.stops[stopId].sequence !== originalSequence[stopId]
+										) {
+											console.log(
+												`  - Stop ${stopId}: ${originalSequence[stopId]} -> ${route.stops[stopId].sequence}`
+											);
+										}
+									});
+
+									// Update route with new sequences
+									await routeRef.set(route);
+								}
+
+								// Get directions for the optimized route
+								await fetchRouteDirections(organizationId, routeId, date);
+								console.log(`Successfully updated route ${routeId} with optimized directions`);
+							} catch (directionError) {
+								console.error(`Error fetching directions for route ${routeId}:`, directionError);
+							}
+						}
+					} else {
+						console.warn(`Failed to get optimization results after ${maxRetries} attempts`);
+					}
+				} else {
+					console.warn("Route optimization not available or failed. Routes were created but not optimized.");
+				}
+			} catch (error) {
+				console.error("Error during route optimization process:", error);
+				console.log("Continuing with unoptimized routes");
+			}
+		} else {
+			console.warn("No routes were created, skipping optimization step");
+		}
 
 		return trimmedData;
 	} catch (error) {
 		console.error("Error fetching data:", error);
 		throw new Error(`Internal server error.`);
 	}
-};
-
-export const initializeOptimizeRoute = async (route: { name: string; value: Route }) => {
-	const environment = functions.config().environment?.mode;
-	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
-	const response = await fetch(`https://${vedispatchUrl}/api/route/optimize`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(route),
-	});
-	const data = await response.json();
-	return data;
-};
-
-export const getOptimizedRoute = async (routeId: string, mapboxOptimizationId: string, date: string) => {
-	const environment = functions.config().environment?.mode;
-	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
-
-	const response = await fetch(
-		`https://${vedispatchUrl}/api/route/optimize?routeId=${routeId}&mapboxOptimizationId=${mapboxOptimizationId}&date=${date}`
-	);
-	const data = await response.json();
-	return data;
 };
 
 export const findLocationViaOpenStreetMaps = async (location: {
@@ -221,4 +321,202 @@ export const findLocationViaOpenStreetMaps = async (location: {
 			longitude: "0",
 		};
 	}
+};
+
+const getRelatedLocation = async (organizationId: string, locationId: string) => {
+	const locationRef = admin.database().ref(`/organizations/${organizationId}/locations/${locationId}`);
+	const locationSnapshot = await locationRef.once("value");
+	const location = locationSnapshot.val() || {};
+	return location;
+};
+
+const transformRouteStopsForVedispatch = async (organizationId: string, route: any) => {
+	const stopIds = Object.keys(route.stops);
+	const stops = await Promise.all(
+		stopIds.map(async (stopId) => {
+			const stop = route.stops[stopId];
+			let locationId: string | undefined = stop.locationId;
+			if (stop.dispatch?.locationId) {
+				locationId = stop.dispatch.locationId;
+			}
+			if (!locationId) {
+				throw new Error("Location ID not found");
+			}
+			const location = await getRelatedLocation(organizationId, locationId);
+			const { latitude, longitude } = location;
+			return {
+				name: stopId,
+				value: {
+					...stop,
+					locationId,
+					location: {
+						...location,
+						latitude: typeof latitude === "string" ? parseFloat(latitude).toFixed(6) : latitude,
+						longitude: typeof longitude === "string" ? parseFloat(longitude).toFixed(6) : longitude,
+					},
+				},
+			};
+		})
+	);
+	console.log(
+		"stops",
+		stops.map((stop) => stop.value.location)
+	);
+	return stops;
+};
+
+const transformVedispatchStopsBackToRoute = (stopsArray: Array<{ name: string; value: any }>) => {
+	// Converteer de array van name/value objecten terug naar een object met stopId als key
+	const stopsObject: { [key: string]: any } = {};
+
+	stopsArray.forEach((stop) => {
+		const { location, ...rest } = stop.value;
+		stopsObject[stop.name] = rest;
+	});
+
+	return stopsObject;
+};
+
+const postRoutesToVedispatch = async (organizationId: string, date: string) => {
+	const environment = functions.config().environment?.mode;
+	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
+
+	console.log(`Using VeDispatch URL: ${vedispatchUrl}`);
+	if (!vedispatchUrl) {
+		console.error(`Missing VeDispatch URL in environment variables for environment: ${environment}`);
+		return null;
+	}
+
+	const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
+	const routesSnapshot = await routesRef.once("value");
+	const routes = routesSnapshot.val() || {};
+
+	const routeIds = Object.keys(routes);
+	console.log(`Found ${routeIds.length} routes to optimize for date: ${date}`);
+
+	if (routeIds.length === 0) {
+		console.log("No routes found to optimize");
+		return null;
+	}
+
+	try {
+		// Just use the first route for now to check connection
+		const routeId = routeIds[0];
+		const routeOptimizationRef = routesRef.child(routeId).child("optimization");
+
+		const apiUrl = `https://${vedispatchUrl}/api/route/optimize`;
+		console.log(`Calling VeDispatch API at: ${apiUrl}`);
+		const route = routes[routeId];
+		const stops = await transformRouteStopsForVedispatch(organizationId, route);
+
+		const response = await fetch(apiUrl, {
+			method: "POST",
+			mode: "cors",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				route: {
+					name: routeId,
+					value: {
+						...route,
+						stops,
+					},
+				},
+			}),
+		});
+
+		console.log(`API Response status: ${response.status} ${response.statusText}`);
+
+		if (!response.ok) {
+			const responseText = await response.text();
+			console.error(
+				`Error response from VeDispatch API: status=${response.status}, body=${responseText.substring(
+					0,
+					200
+				)}...`
+			);
+			return null;
+		}
+
+		const result = await response.json();
+		console.log(`API Response data:`, JSON.stringify(result).substring(0, 200));
+
+		if (!result || !result.mapboxOptimizationId) {
+			console.error("Invalid response from optimization API:", result);
+			return null;
+		}
+
+		if (result.status === "ok") {
+			const res = {
+				id: result.mapboxOptimizationId,
+				status: "PROCESSING",
+				message: "Optimization in progress",
+				lastChecked: moment().toISOString(),
+			};
+
+			await routeOptimizationRef.set(res);
+			return result.mapboxOptimizationId;
+		} else {
+			console.warn(`Optimization did not return success status:`, result.status);
+			return null;
+		}
+	} catch (error) {
+		console.error(`Error during optimization process:`, error);
+		return null;
+	}
+};
+
+const getOptimizationFromVedispatch = async (mapboxOptimizationId: string) => {
+	const environment = functions.config().environment?.mode;
+	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
+
+	const response = await fetch(
+		`https://${vedispatchUrl}/api/route/optimize?mapboxOptimizationId=${mapboxOptimizationId}`
+	);
+	const result = await response.json();
+
+	if (result.status === "ok") {
+		const stopSequence: { stopId: string; index: number }[] = result.stopsWithIndex;
+		return stopSequence;
+	} else {
+		return null;
+	}
+};
+
+const fetchRouteDirections = async (organizationId: string, routeId: string, date: string) => {
+	const environment = functions.config().environment?.mode;
+	const vedispatchUrl = process.env[`${environment}_VEDISPATCH_URL`] as string;
+	const routeRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}/${routeId}`);
+	const routeSnapshot = await routeRef.once("value");
+	const route = routeSnapshot.val() || {};
+	const stops = await transformRouteStopsForVedispatch(organizationId, route);
+	const response = await fetch(`https://${vedispatchUrl}/api/route/directions`, {
+		headers: {
+			"Content-Type": "application/json",
+		},
+		method: "POST",
+		body: JSON.stringify({
+			route: {
+				name: routeId,
+				value: {
+					...route,
+					stops,
+				},
+			},
+		}),
+	});
+	if (response.status !== 200) {
+		throw new Error("Failed to fetch route directions");
+	}
+	const newRoute = await response.json();
+
+	// Als het resultaat stops bevat in array-formaat, converteer ze terug naar object-formaat
+	if (newRoute.value && Array.isArray(newRoute.value.stops)) {
+		// Transformeer de stops van array formaat terug naar object formaat
+		newRoute.value.stops = transformVedispatchStopsBackToRoute(newRoute.value.stops);
+	}
+
+	await routeRef.set(newRoute.value);
+	return newRoute;
 };
