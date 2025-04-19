@@ -16,6 +16,40 @@ interface OldCustomer {
 	streetNumber: string;
 }
 
+interface NewCustomer {
+	code: string;
+	firstName: string;
+	lastName: string;
+	companyName: string;
+	email: string;
+	phoneNumbers: {
+		type: string;
+		countryCode: string;
+		number: string;
+	}[];
+	defaultLocationId: string;
+	customFields: {
+		fieldId: string;
+		fieldName: string;
+		value: string;
+	}[];
+	events: {
+		timestamp: number;
+		description: string;
+		changedBy: string;
+		changed: {
+			action: string;
+			source: string;
+		};
+	}[];
+	notes?: string;
+	type: string;
+	createdBy: string;
+	createdAt: number;
+	modifiedBy: string;
+	modifiedAt: number;
+}
+
 interface ImportResult extends BaseMigrationResult {
 	organizationId: string;
 	customFields: {
@@ -62,25 +96,25 @@ export const importCustomers = functions
 
 			console.log(`Found ${orgIds.length} organizations to process`);
 
-			// Lees de oude customers data one-time
-			const oldCustomersRef = admin.database().ref(`/customers`);
-			const oldCustomersSnapshot = await oldCustomersRef.once("value");
-			const oldCustomers = oldCustomersSnapshot.val() || {};
-
-			if (Object.keys(oldCustomers).length === 0) {
-				res.status(404).send("No customers found in old structure");
-				return;
-			}
-
-			console.log(`Found ${Object.keys(oldCustomers).length} customers in old structure`);
-
 			// Resultaten voor alle organisaties bijhouden
 			const results: ImportResult[] = [];
-
+			let totalCustomers = 0;
 			// Loop door elke organisatie
 			for (const organizationId of orgIds) {
 				console.log(`Processing organization: ${organizationId}`);
 
+				// Lees de oude customers data one-time
+				const oldCustomersRef = admin.database().ref(`/organizations/${organizationId}/customers`);
+				const oldCustomersSnapshot = await oldCustomersRef.once("value");
+				const oldCustomers = oldCustomersSnapshot.val() || {};
+
+				if (Object.keys(oldCustomers).length === 0) {
+					res.status(404).send("No customers found in old structure");
+					return;
+				}
+
+				console.log(`Found ${Object.keys(oldCustomers).length} customers in old structure`);
+				totalCustomers += Object.keys(oldCustomers).length;
 				try {
 					const result = await processOrganization(organizationId, oldCustomers, {
 						dryRun,
@@ -114,7 +148,7 @@ export const importCustomers = functions
 				totalOrganizations: results.length,
 				totalProcessed,
 				totalSkipped,
-				totalCustomers: Object.keys(oldCustomers).length,
+				totalCustomers,
 				executionTimeSeconds: executionTime,
 				dryRun,
 			};
@@ -149,7 +183,7 @@ export const importCustomers = functions
 
 async function processOrganization(
 	organizationId: string,
-	oldCustomers: Record<string, OldCustomer>,
+	oldCustomers: Record<string, OldCustomer | NewCustomer>,
 	options: {
 		dryRun: boolean;
 		batchSize: number;
@@ -253,8 +287,19 @@ async function processOrganization(
 	const totalOldCustomers = Object.keys(oldCustomers).length;
 	console.log(`Processing ${totalOldCustomers} customers for org ${organizationId}...`);
 
-	for (const oldCustomerId in oldCustomers) {
-		const oldCustomer: OldCustomer = oldCustomers[oldCustomerId];
+	for (const customerId in oldCustomers) {
+		const customer = oldCustomers[customerId];
+
+		// Check of dit een nieuwe klant (OldCustomer) of al gemigreerde klant (NewCustomer) is
+		// We gebruiken 'defaultLocationId' als indicator voor een gemigreerde klant
+		if ("defaultLocationId" in customer) {
+			console.log(`Customer ${customerId} is already migrated (has defaultLocationId), skipping.`);
+			result.skipped++;
+			continue;
+		}
+
+		// Cast nu veilig naar OldCustomer, want we weten dat het geen NewCustomer is
+		const oldCustomer = customer as OldCustomer;
 
 		// Controleer of er al een klant bestaat met dezelfde code
 		const existingCustomerId = Object.keys(existingCustomers).find(
@@ -303,7 +348,7 @@ async function processOrganization(
 			}
 		} else {
 			// In dry-run modus, genereer een fake key
-			newLocationId = `dry-run-loc-${oldCustomerId}`;
+			newLocationId = `dry-run-loc-${customerId}`;
 		}
 
 		// Creëer de locatie data
@@ -337,20 +382,9 @@ async function processOrganization(
 			modifiedAt: Date.now(),
 		};
 
-		// Genereer een nieuwe customer ID
-		let newCustomerId: string | null;
-		if (!dryRun) {
-			const newCustomerRef = customersRef.push();
-			newCustomerId = newCustomerRef.key;
-
-			if (!newCustomerId) {
-				console.error(`Failed to create customer key for customer ${oldCustomer.code}`);
-				result.errors.push(`Failed to create customer key for customer ${oldCustomer.code}`);
-				continue;
-			}
-		} else {
-			// In dry-run modus, genereer een fake key
-			newCustomerId = `dry-run-cust-${oldCustomerId}`;
+		// De dry-run check is niet meer nodig voor het ID zelf, alleen voor de melding
+		if (dryRun) {
+			console.log(`Dry run: Using existing ID ${customerId} for customer ${oldCustomer.code}`);
 		}
 
 		// Probeer voor- en achternaam te scheiden
@@ -391,7 +425,7 @@ async function processOrganization(
 			});
 		}
 
-		const newCustomer: any = {
+		const newCustomer: NewCustomer = {
 			firstName,
 			lastName,
 			companyName,
@@ -421,7 +455,7 @@ async function processOrganization(
 
 		// Voeg toe aan batch updates
 		updatesLocation[newLocationId] = newLocation;
-		updatesCustomer[newCustomerId] = newCustomer;
+		updatesCustomer[customerId] = newCustomer;
 
 		result.processed++;
 

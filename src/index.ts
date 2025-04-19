@@ -1,7 +1,13 @@
 import * as admin from "firebase-admin";
 // import { Agent, fetch, setGlobalDispatcher } from "undici";
-import { fetchArugasData, scheduledFetchArugasData } from "./arugas";
+import {
+	fetchArugasData,
+	scheduledFetchArugasData,
+	updateDuplicateLocationCoordinates,
+	updateMissingLocations,
+} from "./arugas";
 import { updateArugasCustomerLocation } from "./arugas/Event";
+import { sanitizeArugasCoordinates } from "./arugas/sanitizeCoordinates";
 import { cleanUpDuplicateCustomers } from "./helper/CleanUpUnusedCustomers";
 import { fetchLastLocationUsers } from "./location";
 import { importCustomers } from "./migrations/customers/importCustomers";
@@ -56,14 +62,20 @@ admin.initializeApp({
 exports.fetchArugasData = fetchArugasData;
 exports.scheduledFetchArugasData = scheduledFetchArugasData;
 exports.updateArugasCustomerLocation = updateArugasCustomerLocation;
+exports.sanitizeArugasCoordinates = sanitizeArugasCoordinates;
 exports.importCustomers = importCustomers;
 exports.validateCustomerMigration = validateCustomerMigration;
+exports.rollbackCustomerMigration =
+	require("./migrations/customers/rollbackCustomerMigration").rollbackCustomerMigration;
+exports.restoreFromBackup = require("./migrations/utils/generalRollback").restoreFromBackup;
 
 exports.removeAllOrders = removeAllOrders;
 exports.fetchLastUserLocation = fetchLastUserLocation;
 
 exports.fetchLastLocationUsers = fetchLastLocationUsers;
 exports.cleanUpDuplicateCustomers = cleanUpDuplicateCustomers;
+exports.updateMissingLocations = updateMissingLocations;
+exports.updateDuplicateLocationCoordinates = updateDuplicateLocationCoordinates;
 
 // Test functie om de config te controleren
 export const getConfig = functions.https.onRequest((req, res) => {
