@@ -61,7 +61,7 @@ export const scheduledFetchArugasData = functions
 		memory: "1GB",
 		timeoutSeconds: 540,
 	})
-	.pubsub.schedule("every day 18:00")
+	.pubsub.schedule("every day 17:00")
 	.timeZone("UTC")
 	.onRun(async (context) => {
 		console.log("Running a task every day at 00.00 AM");

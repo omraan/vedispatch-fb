@@ -117,11 +117,20 @@ export const getArugasData = async (date: string) => {
 	} else {
 		transitPointId =
 			Object.keys(transitPoints).find((key) => transitPoints[key].title === "Arugas Warehouse") || null;
-		locationId = transitPoints[transitPointId!].locationId;
+
+		if (transitPointId && transitPoints[transitPointId]) {
+			locationId = transitPoints[transitPointId].locationId;
+		} else {
+			console.error(
+				"Transit point 'Arugas Warehouse' not found in existing transit points:",
+				Object.keys(transitPoints)
+			);
+			throw new Error("Transit point 'Arugas Warehouse' not found");
+		}
 	}
 
-	if (!transitPointId) {
-		throw new Error("Transit point not found");
+	if (!transitPointId || !locationId) {
+		throw new Error("Transit point or location not found");
 	}
 
 	try {
@@ -185,108 +194,8 @@ export const getArugasData = async (date: string) => {
 	}
 };
 
-const optimizeRoute = async (organizationId: string, date: string, routeId: string) => {
-	const mapboxOptimizationId = await postRouteToVedispatch(organizationId, date, routeId);
-
-	if (mapboxOptimizationId) {
-		console.log(`Starting optimization polling for ID: ${mapboxOptimizationId}`);
-
-		// Function to wait for a specified time
-		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-		// Polling mechanism with retries
-		const maxRetries = 10;
-		const pollingInterval = 5000; // 5 seconds
-
-		let optimizationResult = null;
-		let retryCount = 0;
-
-		// Poll until we get a result or reach max retries
-		while (retryCount < maxRetries && !optimizationResult) {
-			console.log(`Polling optimization status (attempt ${retryCount + 1}/${maxRetries})...`);
-
-			try {
-				// Wait before checking
-				await sleep(pollingInterval);
-
-				// Check optimization status
-				optimizationResult = await getOptimizationFromVedispatch(mapboxOptimizationId);
-
-				if (optimizationResult) {
-					console.log(`Optimization completed successfully after ${retryCount + 1} attempts`);
-				}
-			} catch (error) {
-				console.error(`Error polling optimization (attempt ${retryCount + 1}):`, error);
-			}
-
-			retryCount++;
-		}
-
-		// If we have optimization results, update the route with the new stop sequence
-		if (optimizationResult) {
-			// Get routes to apply optimization results
-			const routesRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}`);
-			const routesSnapshot = await routesRef.once("value");
-			const routes = routesSnapshot.val() || {};
-			const routeIds = Object.keys(routes);
-
-			// Apply optimization results to each route
-			for (const routeId of routeIds) {
-				try {
-					console.log(`Fetching directions for route: ${routeId}`);
-
-					// Update route with stop sequence optimization before getting directions
-					const routeRef = routesRef.child(routeId);
-					const routeSnapshot = await routeRef.once("value");
-					const route = routeSnapshot.val();
-
-					if (route && route.stops) {
-						// Record original sequence for logging
-						const originalSequence: { [stopId: string]: number } = {};
-						Object.keys(route.stops).forEach((stopId) => {
-							if (route.stops[stopId].sequence !== undefined) {
-								originalSequence[stopId] = route.stops[stopId].sequence;
-							}
-						});
-
-						// Update stop sequences based on optimization results
-						optimizationResult.forEach((stop) => {
-							if (route.stops[stop.stopId]) {
-								route.stops[stop.stopId].sequence = stop.index;
-							}
-						});
-
-						// Log sequence changes
-						console.log(`Updated stop sequence for route ${routeId}:`);
-						Object.keys(route.stops).forEach((stopId) => {
-							if (
-								originalSequence[stopId] !== undefined &&
-								route.stops[stopId].sequence !== originalSequence[stopId]
-							) {
-								console.log(
-									`  - Stop ${stopId}: ${originalSequence[stopId]} -> ${route.stops[stopId].sequence}`
-								);
-							}
-						});
-
-						// Update route with new sequences
-						await routeRef.set(route);
-					}
-
-					// Get directions for the optimized route
-					await fetchRouteDirections(organizationId, routeId, date);
-					console.log(`Successfully updated route ${routeId} with optimized directions`);
-				} catch (directionError) {
-					console.error(`Error fetching directions for route ${routeId}:`, directionError);
-				}
-			}
-		} else {
-			console.warn(`Failed to get optimization results after ${maxRetries} attempts`);
-		}
-	} else {
-		console.warn("Route optimization not available or failed. Routes were created but not optimized.");
-	}
-};
+// Cache voor OpenStreetMap API calls om duplicate requests te voorkomen
+const locationCache = new Map<string, { latitude: string; longitude: string }>();
 
 export const findLocationViaOpenStreetMaps = async (location: {
 	streetName: string;
@@ -296,33 +205,74 @@ export const findLocationViaOpenStreetMaps = async (location: {
 	try {
 		const address = `${location.streetName} ${location.streetNumber} ${location.city} Aruba`;
 
+		// Check cache first
+		if (locationCache.has(address)) {
+			const cachedResult = locationCache.get(address)!;
+			console.log(`Using cached location for ${address}: ${cachedResult.latitude}, ${cachedResult.longitude}`);
+			return cachedResult;
+		}
+
+		// Add delay to respect rate limiting (1 request per second for Nominatim)
+		await new Promise((resolve) => setTimeout(resolve, 1100));
+
 		const response = await fetch(
-			`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}`
-		);
-		const data = await response.json();
-		if (data.length > 0) {
-			const { lat: latitude, lon: longitude } = data[0];
-			if (latitude === undefined || longitude === undefined) {
-				console.log("No location found");
-				return {
-					latitude: "0",
-					longitude: "0",
-				};
+			`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}`,
+			{
+				headers: {
+					"User-Agent": "Innova-GPS-Tracking-App/1.0 (contact@innova.com)",
+					Accept: "application/json",
+				},
 			}
-			return { latitude, longitude };
+		);
+
+		// Check if response is ok and content-type is JSON
+		if (!response.ok) {
+			console.log(`HTTP error ${response.status} for address: ${address}`);
+			const result = { latitude: "0", longitude: "0" };
+			locationCache.set(address, result);
+			return result;
+		}
+
+		const contentType = response.headers.get("content-type");
+		if (!contentType || !contentType.includes("application/json")) {
+			console.log(`Non-JSON response received for address: ${address}. Content-Type: ${contentType}`);
+			const result = { latitude: "0", longitude: "0" };
+			locationCache.set(address, result);
+			return result;
+		}
+
+		const data = await response.json();
+		if (data && data.length > 0) {
+			const { lat: latitude, lon: longitude } = data[0];
+			if (
+				latitude === undefined ||
+				longitude === undefined ||
+				latitude < 12.3 ||
+				latitude > 12.7 ||
+				longitude < -70.2 ||
+				longitude > -69.7
+			) {
+				console.log(`Location found but coordinates out of Aruba bounds for address: ${address}`);
+				const result = { latitude: "0", longitude: "0" };
+				locationCache.set(address, result);
+				return result;
+			}
+			console.log(`Location found for ${address}: ${latitude}, ${longitude}`);
+			const result = { latitude: latitude.toString(), longitude: longitude.toString() };
+			locationCache.set(address, result);
+			return result;
 		} else {
-			console.log("No location found");
-			return {
-				latitude: "0",
-				longitude: "0",
-			};
+			console.log(`No location found for address: ${address}`);
+			const result = { latitude: "0", longitude: "0" };
+			locationCache.set(address, result);
+			return result;
 		}
 	} catch (error) {
-		console.log(error);
-		return {
-			latitude: "0",
-			longitude: "0",
-		};
+		console.log(`Error finding location for address: ${location.streetName} ${location.streetNumber}`, error);
+		const result = { latitude: "0", longitude: "0" };
+		const address = `${location.streetName} ${location.streetNumber} ${location.city} Aruba`;
+		locationCache.set(address, result);
+		return result;
 	}
 };
 
@@ -406,21 +356,24 @@ const postRouteToVedispatch = async (organizationId: string, date: string, route
 		console.log(`Calling VeDispatch API at: ${apiUrl}`);
 		const stops = await transformRouteStopsForVedispatch(organizationId, route);
 
+		// Create the request body first to ensure consistency
+		const requestBody = JSON.stringify({
+			route: {
+				name: routeId,
+				value: {
+					...route,
+					stops,
+				},
+			},
+		});
+
 		const response = await fetch(apiUrl, {
 			method: "POST",
-			mode: "cors",
 			headers: {
 				"Content-Type": "application/json",
+				"Content-Length": Buffer.byteLength(requestBody).toString(),
 			},
-			body: JSON.stringify({
-				route: {
-					name: routeId,
-					value: {
-						...route,
-						stops,
-					},
-				},
-			}),
+			body: requestBody,
 		});
 
 		console.log(`API Response status: ${response.status} ${response.statusText}`);
@@ -492,20 +445,24 @@ const fetchRouteDirections = async (organizationId: string, routeId: string, dat
 	// Haal de huidige optimization ID op als deze bestaat
 	const currentOptimizationId = route.optimization?.id || null;
 
+	// Create the request body first to ensure consistency
+	const requestBody = JSON.stringify({
+		route: {
+			name: routeId,
+			value: {
+				...route,
+				stops,
+			},
+		},
+	});
+
 	const response = await fetch(`https://${vedispatchUrl}/api/route/directions`, {
 		headers: {
 			"Content-Type": "application/json",
+			"Content-Length": Buffer.byteLength(requestBody).toString(),
 		},
 		method: "POST",
-		body: JSON.stringify({
-			route: {
-				name: routeId,
-				value: {
-					...route,
-					stops,
-				},
-			},
-		}),
+		body: requestBody,
 	});
 	if (response.status !== 200) {
 		throw new Error("Failed to fetch route directions");
@@ -533,4 +490,98 @@ const fetchRouteDirections = async (organizationId: string, routeId: string, dat
 		optimization,
 	});
 	return newRoute;
+};
+
+const optimizeRoute = async (organizationId: string, date: string, routeId: string) => {
+	const mapboxOptimizationId = await postRouteToVedispatch(organizationId, date, routeId);
+
+	if (mapboxOptimizationId) {
+		console.log(`Starting optimization polling for ID: ${mapboxOptimizationId}`);
+
+		// Function to wait for a specified time
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+		// Polling mechanism with retries
+		const maxRetries = 10;
+		const pollingInterval = 5000; // 5 seconds
+
+		let optimizationResult = null;
+		let retryCount = 0;
+
+		// Poll until we get a result or reach max retries
+		while (retryCount < maxRetries && !optimizationResult) {
+			console.log(`Polling optimization status (attempt ${retryCount + 1}/${maxRetries})...`);
+
+			try {
+				// Wait before checking
+				await sleep(pollingInterval);
+
+				// Check optimization status
+				optimizationResult = await getOptimizationFromVedispatch(mapboxOptimizationId);
+
+				if (optimizationResult) {
+					console.log(`Optimization completed successfully after ${retryCount + 1} attempts`);
+				}
+			} catch (error) {
+				console.error(`Error polling optimization (attempt ${retryCount + 1}):`, error);
+			}
+
+			retryCount++;
+		}
+
+		// If we have optimization results, update the route with the new stop sequence
+		if (optimizationResult) {
+			// Get routes to apply optimization results
+
+			// Apply optimization results to each route
+			try {
+				console.log(`Fetching directions for route: ${routeId}`);
+				const routeRef = admin.database().ref(`/organizations/${organizationId}/routes/${date}/${routeId}`);
+				const routeSnapshot = await routeRef.once("value");
+				const route = routeSnapshot.val() || {};
+				if (route && route.stops) {
+					// Record original sequence for logging
+					const originalSequence: { [stopId: string]: number } = {};
+					Object.keys(route.stops).forEach((stopId) => {
+						if (route.stops[stopId].sequence !== undefined) {
+							originalSequence[stopId] = route.stops[stopId].sequence;
+						}
+					});
+
+					// Update stop sequences based on optimization results
+					optimizationResult.forEach((stop) => {
+						if (route.stops[stop.stopId]) {
+							route.stops[stop.stopId].sequence = stop.index;
+						}
+					});
+
+					// Log sequence changes
+					console.log(`Updated stop sequence for route ${routeId}:`);
+					Object.keys(route.stops).forEach((stopId) => {
+						if (
+							originalSequence[stopId] !== undefined &&
+							route.stops[stopId].sequence !== originalSequence[stopId]
+						) {
+							console.log(
+								`  - Stop ${stopId}: ${originalSequence[stopId]} -> ${route.stops[stopId].sequence}`
+							);
+						}
+					});
+
+					// Update route with new sequences
+					await routeRef.set(route);
+				}
+
+				// Get directions for the optimized route
+				await fetchRouteDirections(organizationId, routeId, date);
+				console.log(`Successfully updated route ${routeId} with optimized directions`);
+			} catch (directionError) {
+				console.error(`Error fetching directions for route ${routeId}:`, directionError);
+			}
+		} else {
+			console.warn(`Failed to get optimization results after ${maxRetries} attempts`);
+		}
+	} else {
+		console.warn("Route optimization not available or failed. Routes were created but not optimized.");
+	}
 };

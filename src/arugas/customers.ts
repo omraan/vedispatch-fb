@@ -42,6 +42,8 @@ export const checkAndAddCustomers = async (
 				let latitude = item.latitude;
 				let longitude = item.longitude;
 				let sanitizedStreetName = item.clientStreetName || "";
+
+				// Only call OpenStreetMap API if coordinates are invalid
 				if (
 					!latitude ||
 					!longitude ||
@@ -49,15 +51,29 @@ export const checkAndAddCustomers = async (
 					parseFloat(longitude) === 0 ||
 					isInvalidCoordinate(parseFloat(latitude), parseFloat(longitude))
 				) {
-					console.log(`Invalid coordinates for customer ${item.clientID}, sanitizing to 0,0.`);
+					console.log(
+						`Invalid coordinates for customer ${item.clientID} (${latitude}, ${longitude}). Attempting to geocode address.`
+					);
 					sanitizedStreetName = replaceInvalidStreetNames(item.clientStreetName || "");
-					const location = await findLocationViaOpenStreetMaps({
-						streetName: sanitizedStreetName,
-						streetNumber: item.clientHouseNumber || "",
-						city: "",
-					});
-					latitude = location.latitude;
-					longitude = location.longitude;
+
+					// Only make API call if we have a meaningful address
+					if (sanitizedStreetName.trim() || item.clientHouseNumber?.trim()) {
+						const location = await findLocationViaOpenStreetMaps({
+							streetName: sanitizedStreetName,
+							streetNumber: item.clientHouseNumber || "",
+							city: "",
+						});
+						latitude = location.latitude;
+						longitude = location.longitude;
+					} else {
+						console.log(
+							`No valid address to geocode for customer ${item.clientID}, using default coordinates.`
+						);
+						latitude = "0";
+						longitude = "0";
+					}
+				} else {
+					console.log(`Valid coordinates found for customer ${item.clientID}: ${latitude}, ${longitude}`);
 				}
 
 				// Zet location-data

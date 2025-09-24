@@ -32,6 +32,13 @@ export type ArugasData = {
 	Cylinder4: string;
 	Cylinder5: string;
 	Cylinder6: string;
+	YTD_CYL: string;
+	Routecode: string;
+	BatchHistory: string;
+	deposit_item: string;
+	deposit_descr: string;
+	deposit_amount: string;
+	deposit_pricelist: string;
 };
 
 // Type definitie voor een route

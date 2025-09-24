@@ -80,6 +80,26 @@ export const replaceInvalidStreetNames = (streetName: string): string => {
 			invalid: "Baranka",
 			valid: "Baranca",
 		},
+		{
+			invalid: "Juana Mortostraat",
+			valid: "Juwana Mortostraat",
+		},
+		{
+			invalid: "Parkietenbosch",
+			valid: "Parkietenbos",
+		},
+		{
+			invalid: "Wayaca Residence",
+			valid: "Wayaca",
+		},
+		{
+			invalid: "Wayaca Residence",
+			valid: "Wayaca",
+		},
+		{
+			invalid: "Nua",
+			valid: "Nune",
+		},
 	];
 
 	if (!streetName) return streetName;

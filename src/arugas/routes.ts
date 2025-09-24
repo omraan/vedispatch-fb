@@ -172,6 +172,28 @@ export const addRoutes = async (
 							`Order ${orderLine.orderNumber} toevoegen aan bestaande stop voor klant ${clientID} in route ${vehicleKey}`
 						);
 
+						const orderLines = [
+							{
+								product: {
+									code: orderLine.Productcode,
+									description: orderLine.ProductDescription,
+									price: parseFloat(orderLine.Product_price),
+								},
+								quantity: parseFloat(orderLine.Product_quantity),
+							},
+						];
+
+						if (parseFloat(orderLine.deposit_amount) > 0) {
+							orderLines.push({
+								product: {
+									code: orderLine.deposit_item,
+									description: orderLine.deposit_descr,
+									price: parseFloat(orderLine.deposit_amount),
+								},
+								quantity: 1,
+							});
+						}
+
 						// Create the new order object
 						const newOrder = {
 							orderNumber: orderLine.orderNumber,
@@ -182,19 +204,25 @@ export const addRoutes = async (
 											fieldName: "transaction_type",
 											value: orderLine.Transactiontype,
 										},
+										{
+											fieldId: "batch_number",
+											fieldName: "batch_number",
+											value: orderLine.routeNumber,
+										},
+										{
+											fieldId: "supplied_cylinder_ytd",
+											fieldName: "supplied_cylinder_ytd",
+											value: orderLine.YTD_CYL,
+										},
+										{
+											fieldId: "route_code",
+											fieldName: "route_code",
+											value: orderLine.Routecode,
+										},
 								  ]
 								: [],
-							orderLines: [
-								{
-									product: {
-										code: orderLine.Productcode,
-										description: orderLine.ProductDescription,
-										price: parseFloat(orderLine.Product_price),
-									},
-									quantity: parseFloat(orderLine.Product_quantity),
-								},
-							],
-							totalPrice: parseFloat(orderLine.Total_price),
+							orderLines,
+							totalPrice: parseFloat(orderLine.Total_price) + parseFloat(orderLine.deposit_amount),
 						};
 
 						// Add the new order to the existing stop's dispatch orders
@@ -244,7 +272,12 @@ export const addRoutes = async (
 					customerId,
 					locationId: customers[customerId].defaultLocationId,
 					notes: orderLine.notes || "",
-					category: orderLine.Type === "Commercial" ? "priority" : null,
+					category:
+						orderLine.Type === "Commercial"
+							? "commercial"
+							: orderLine.BatchHistory.length > 0
+							? "priority"
+							: null,
 				};
 
 				customerOrdersMap[clientID].push(input);
@@ -322,21 +355,57 @@ export const addRoutes = async (
 											value: order.orderLine.Transactiontype,
 										});
 									}
+
+									if (order.orderLine.routeNumber) {
+										customFields.push({
+											fieldId: "batch_number",
+											fieldName: "batch_number",
+											value: order.orderLine.routeNumber,
+										});
+									}
+									if (order.orderLine.YTD_CYL) {
+										customFields.push({
+											fieldId: "supplied_cylinder_ytd",
+											fieldName: "supplied_cylinder_ytd",
+											value: order.orderLine.YTD_CYL,
+										});
+									}
+									if (order.orderLine.Routecode) {
+										customFields.push({
+											fieldId: "route_code",
+											fieldName: "route_code",
+											value: order.orderLine.Routecode,
+										});
+									}
+
+									const orderLines = [
+										{
+											product: {
+												code: order.orderLine.Productcode,
+												description: order.orderLine.ProductDescription,
+												price: parseFloat(order.orderLine.Product_price),
+											},
+											quantity: parseFloat(order.orderLine.Product_quantity),
+										},
+									];
+									if (parseFloat(order.orderLine.deposit_amount) > 0) {
+										orderLines.push({
+											product: {
+												code: order.orderLine.deposit_item,
+												description: order.orderLine.deposit_descr,
+												price: parseFloat(order.orderLine.deposit_amount),
+											},
+											quantity: 1,
+										});
+									}
+
 									return {
 										orderNumber: order.orderLine.orderNumber,
 										customFields,
-										orderLines: [
-											{
-												product: {
-													code: order.orderLine.Productcode,
-													description: order.orderLine.ProductDescription,
-													price: parseFloat(order.orderLine.Product_price),
-												},
-												quantity: parseFloat(order.orderLine.Product_quantity),
-											},
-										],
-
-										totalPrice: parseFloat(order.orderLine.Total_price),
+										orderLines,
+										totalPrice:
+											parseFloat(order.orderLine.Total_price) +
+											parseFloat(order.orderLine.deposit_amount),
 									};
 								}
 							)
